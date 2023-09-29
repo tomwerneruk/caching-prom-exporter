@@ -12,8 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"github.com/tomwerneruk/caching-prom-exporter/internal/datasource"
+	"github.com/tomwerneruk/caching-prom-exporter/internal/metrics"
 )
 
 var (
@@ -31,17 +30,15 @@ var (
 
 func main() {
 
+	var enabledMetrics = map[metrics.Metric]bool{
+		metrics.MetricEbsVolumeCount{}: true,
+	}
+
 	// define a loader function, this is used for populating cache items when it is empty / expired
 	loader := ttlcache.LoaderFunc[string, float64](
 		func(c *ttlcache.Cache[string, float64], key string) *ttlcache.Item[string, float64] {
 			log.Println("Refreshing data from remote source")
 			log.Println(fmt.Sprintf("Populating key %s", key))
-			switch key {
-			case "ebs_vol_count":
-				return c.Set("ebs_vol_count", datasource.GetEbsCount(), time.Second*45)
-			case "ebs_snap_count":
-				return c.Set("ebs_snap_count", datasource.GetSnapCount(), time.Second*45)
-			}
 
 			return nil
 		},
