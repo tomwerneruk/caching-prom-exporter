@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-co-op/gocron"
@@ -30,8 +31,17 @@ var (
 
 func main() {
 
-	var enabledMetrics = map[metrics.Metric]bool{
+	var availableMetrics = map[metrics.Metric]bool{
 		metrics.MetricEbsVolumeCount{}: true,
+	}
+
+	enabledMetrics := []metrics.Metric{}
+
+	for metric, enabled := range availableMetrics {
+		if *enabled {
+			log.Println("msg", "Scraper enabled", "scraper", metric.Name())
+			enabledMetrics = append(enabledMetrics, metric)
+		}
 	}
 
 	// define a loader function, this is used for populating cache items when it is empty / expired
@@ -61,16 +71,73 @@ func main() {
 	// setup a regular tick to populate our prom metrics with the cache. This may end up doing a lazy
 	// refresh of the cache item via the loader, if required
 	s := gocron.NewScheduler(time.UTC)
-
-	createMetricRefresh(ebsVolumes, "ebs_vol_count", 30, s, cache)
-	createMetricRefresh(ebsSnapshots, "ebs_snap_count", 30, s, cache)
-
 	s.StartAsync()
 
 	// serve our prom client
-	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/metrics", promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, newHandler(enabledMetrics, log.Logger{})))
 	http.ListenAndServe(":2112", nil)
 
+}
+
+func newHandler(scrapers []metrics.Metric, logger log.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var dsn string
+		var err error
+		target := ""
+		q := r.URL.Query()
+		if q.Has("target") {
+			target = q.Get("target")
+		}
+
+		cfg := c.GetConfig()
+		cfgsection, ok := cfg.Sections["client"]
+		if !ok {
+			log.Fatalln("msg", "Failed to parse section [client] from config file", "err", err)
+		}
+		if dsn, err = cfgsection.FormDSN(target); err != nil {
+			log.Fatalln("msg", "Failed to form dsn from section [client]", "err", err)
+		}
+
+		collect := q["collect[]"]
+
+		// Use request context for cancellation when connection gets closed.
+		ctx := r.Context()
+		// If a timeout is configured via the Prometheus header, add it to the context.
+		if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
+			timeoutSeconds, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				log.Fatalln("msg", "Failed to parse timeout from Prometheus header", "err", err)
+			} else {
+				if *timeoutOffset >= timeoutSeconds {
+					// Ignore timeout offset if it doesn't leave time to scrape.
+					log.Fatalln("msg", "Timeout offset should be lower than prometheus scrape timeout", "offset", *timeoutOffset, "prometheus_scrape_timeout", timeoutSeconds)
+				} else {
+					// Subtract timeout offset from timeout.
+					timeoutSeconds -= *timeoutOffset
+				}
+				// Create new timeout context with request context as parent.
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSeconds*float64(time.Second)))
+				defer cancel()
+				// Overwrite request with timeout context.
+				r = r.WithContext(ctx)
+			}
+		}
+
+		filteredScrapers := filterScrapers(scrapers, collect)
+
+		registry := prometheus.NewRegistry()
+
+		registry.MustRegister(metrics.New(ctx, filteredScrapers, log.Logger{}))
+
+		gatherers := prometheus.Gatherers{
+			prometheus.DefaultGatherer,
+			registry,
+		}
+		// Delegate http serving to Prometheus client library, which will call metrics.Collect.
+		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
+		h.ServeHTTP(w, r)
+	}
 }
 
 func createMetricRefresh(metric prometheus.Gauge, cacheKey string, ttl int, cron_scheduler *gocron.Scheduler, cache_ref *ttlcache.Cache[string, float64]) {
