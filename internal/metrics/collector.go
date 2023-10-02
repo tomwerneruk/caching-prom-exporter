@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -18,10 +19,13 @@ type Metric interface {
 	Help() string
 
 	// Scrape collects data and sends it over channel as prometheus metric
-	Scrape(ctx context.Context, ch chan<- prometheus.Metric, logger log.Logger) error
+	Scrape(ctx context.Context, ch chan<- prometheus.Metric, logger log.Logger, cache *ttlcache.Cache[string, float64]) error
+
+	// The method to grab the value from the API / datasource.
+	ExternalDataPull() float64
 }
 
-// MetricExporter collects MySQL metrics. It implements prometheus.Collector.
+// MetricExporter collects metrics. It implements prometheus.Collector.
 type MetricExporter struct {
 	ctx     context.Context
 	logger  log.Logger
@@ -43,7 +47,7 @@ var (
 	)
 )
 
-// New returns a new MySQL MetricExporter for the provided DSN.
+// New returns a new MetricExporter for the provided DSN.
 func New(ctx context.Context, metrics []Metric, logger log.Logger) *MetricExporter {
 	return &MetricExporter{
 		ctx:     ctx,
@@ -54,16 +58,17 @@ func New(ctx context.Context, metrics []Metric, logger log.Logger) *MetricExport
 
 // Describe implements prometheus.Collector.
 func (e *MetricExporter) Describe(ch chan<- *prometheus.Desc) {
-	// ch <- mysqlUp
+	// TODO
 }
 
 // Collect implements prometheus.Collector.
 func (e *MetricExporter) Collect(ch chan<- prometheus.Metric) {
-	e.scrape(e.ctx, ch)
+	cache := e.ctx.Value("cacheRef").(*ttlcache.Cache[string, float64])
+	e.scrape(e.ctx, ch, cache)
 }
 
-// scrape collects metrics from the target, returns an up metric value.
-func (e *MetricExporter) scrape(ctx context.Context, ch chan<- prometheus.Metric) float64 {
+// scrape collects metrics from the target, returns an up metric value
+func (e *MetricExporter) scrape(ctx context.Context, ch chan<- prometheus.Metric, cache_ref *ttlcache.Cache[string, float64]) float64 {
 	scrapeTime := time.Now()
 
 	ch <- prometheus.MustNewConstMetric(metricScrapeDurationSeconds, prometheus.GaugeValue, time.Since(scrapeTime).Seconds(), "connection")
@@ -77,7 +82,7 @@ func (e *MetricExporter) scrape(ctx context.Context, ch chan<- prometheus.Metric
 			label := "collect." + metric.Name()
 			scrapeTime := time.Now()
 			collectorSuccess := 1.0
-			if err := metric.Scrape(ctx, ch, log.Logger{}); err != nil {
+			if err := metric.Scrape(ctx, ch, log.Logger{}, cache_ref); err != nil {
 				log.Println("msg", "Error from metric", "metric", metric.Name(), "target", "err", err)
 				collectorSuccess = 0.0
 			}

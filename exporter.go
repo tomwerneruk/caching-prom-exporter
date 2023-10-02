@@ -11,46 +11,28 @@ import (
 	"github.com/go-co-op/gocron"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tomwerneruk/caching-prom-exporter/internal/metrics"
+	"golang.org/x/exp/maps"
 )
 
-var (
-	ebsVolumes = promauto.NewGauge(prometheus.GaugeOpts{
-		Name:      "ebs_volumes_count",
-		Help:      "The total number of ebs volumes in account",
-		Namespace: "account_trends",
-	})
-	ebsSnapshots = promauto.NewGauge(prometheus.GaugeOpts{
-		Name:      "ebs_snapshots_count",
-		Help:      "The total number of ebs snapshots in account",
-		Namespace: "account_trends",
-	})
-)
+var timeoutOffset float64 = 0.25
 
 func main() {
 
-	var availableMetrics = map[metrics.Metric]bool{
-		metrics.MetricEbsVolumeCount{}: true,
-	}
-
-	enabledMetrics := []metrics.Metric{}
-
-	for metric, enabled := range availableMetrics {
-		if *enabled {
-			log.Println("msg", "Scraper enabled", "scraper", metric.Name())
-			enabledMetrics = append(enabledMetrics, metric)
-		}
+	var availableMetrics = map[string]metrics.Metric{
+		"ebsVolumeCount": metrics.MetricEbsVolumeCount{},
 	}
 
 	// define a loader function, this is used for populating cache items when it is empty / expired
+	// This invokes the ExternalDataPull method on a metric under metrics package. This allows custom
+	// funcationality to get the value
 	loader := ttlcache.LoaderFunc[string, float64](
 		func(c *ttlcache.Cache[string, float64], key string) *ttlcache.Item[string, float64] {
 			log.Println("Refreshing data from remote source")
 			log.Println(fmt.Sprintf("Populating key %s", key))
-
-			return nil
+			item := c.Set(key, availableMetrics[key].ExternalDataPull(), time.Second*3)
+			return item
 		},
 	)
 
@@ -73,32 +55,17 @@ func main() {
 	s := gocron.NewScheduler(time.UTC)
 	s.StartAsync()
 
+	availableMetricsList := maps.Values(availableMetrics)
+
 	// serve our prom client
-	http.Handle("/metrics", promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, newHandler(enabledMetrics, log.Logger{})))
+	http.Handle("/metrics", promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, promHandler(availableMetricsList, log.Logger{}, cache)))
+	log.Println("Starting server")
 	http.ListenAndServe(":2112", nil)
 
 }
 
-func newHandler(scrapers []metrics.Metric, logger log.Logger) http.HandlerFunc {
+func promHandler(scrapers []metrics.Metric, logger log.Logger, cache_ref *ttlcache.Cache[string, float64]) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var dsn string
-		var err error
-		target := ""
-		q := r.URL.Query()
-		if q.Has("target") {
-			target = q.Get("target")
-		}
-
-		cfg := c.GetConfig()
-		cfgsection, ok := cfg.Sections["client"]
-		if !ok {
-			log.Fatalln("msg", "Failed to parse section [client] from config file", "err", err)
-		}
-		if dsn, err = cfgsection.FormDSN(target); err != nil {
-			log.Fatalln("msg", "Failed to form dsn from section [client]", "err", err)
-		}
-
-		collect := q["collect[]"]
 
 		// Use request context for cancellation when connection gets closed.
 		ctx := r.Context()
@@ -108,12 +75,12 @@ func newHandler(scrapers []metrics.Metric, logger log.Logger) http.HandlerFunc {
 			if err != nil {
 				log.Fatalln("msg", "Failed to parse timeout from Prometheus header", "err", err)
 			} else {
-				if *timeoutOffset >= timeoutSeconds {
+				if timeoutOffset >= timeoutSeconds {
 					// Ignore timeout offset if it doesn't leave time to scrape.
-					log.Fatalln("msg", "Timeout offset should be lower than prometheus scrape timeout", "offset", *timeoutOffset, "prometheus_scrape_timeout", timeoutSeconds)
+					log.Fatalln("msg", "Timeout offset should be lower than prometheus scrape timeout", "offset", timeoutOffset, "prometheus_scrape_timeout", timeoutSeconds)
 				} else {
 					// Subtract timeout offset from timeout.
-					timeoutSeconds -= *timeoutOffset
+					timeoutSeconds -= timeoutOffset
 				}
 				// Create new timeout context with request context as parent.
 				var cancel context.CancelFunc
@@ -124,11 +91,10 @@ func newHandler(scrapers []metrics.Metric, logger log.Logger) http.HandlerFunc {
 			}
 		}
 
-		filteredScrapers := filterScrapers(scrapers, collect)
-
 		registry := prometheus.NewRegistry()
 
-		registry.MustRegister(metrics.New(ctx, filteredScrapers, log.Logger{}))
+		ctxWithCache := context.WithValue(ctx, "cacheRef", cache_ref)
+		registry.MustRegister(metrics.New(ctxWithCache, scrapers, log.Logger{}))
 
 		gatherers := prometheus.Gatherers{
 			prometheus.DefaultGatherer,
@@ -138,15 +104,4 @@ func newHandler(scrapers []metrics.Metric, logger log.Logger) http.HandlerFunc {
 		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
 		h.ServeHTTP(w, r)
 	}
-}
-
-func createMetricRefresh(metric prometheus.Gauge, cacheKey string, ttl int, cron_scheduler *gocron.Scheduler, cache_ref *ttlcache.Cache[string, float64]) {
-
-	cron_scheduler.Every(30).Seconds().Do(func() {
-		log.Println(fmt.Sprintf("Refreshing gauge for %s", cacheKey))
-		item := cache_ref.Get(cacheKey)
-		metric.Set(item.Value())
-		log.Printf("Item %s Expiry: %s", item.Key(), item.ExpiresAt())
-	})
-
 }

@@ -6,6 +6,7 @@ require (
 	github.com/go-co-op/gocron v1.34.2
 	github.com/jellydator/ttlcache/v3 v3.1.0
 	github.com/prometheus/client_golang v1.16.0
+	golang.org/x/exp v0.0.0-20230905200255-921286631fa9
 )
 
 require (
@@ -20,6 +21,6 @@ require (
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	go.uber.org/atomic v1.9.0 // indirect
 	golang.org/x/sync v0.2.0 // indirect
-	golang.org/x/sys v0.8.0 // indirect
+	golang.org/x/sys v0.12.0 // indirect
 	google.golang.org/protobuf v1.30.0 // indirect
 )
