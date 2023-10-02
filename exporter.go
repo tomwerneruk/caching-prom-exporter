@@ -45,6 +45,7 @@ func main() {
 
 	cache.OnEviction(func(ctx context.Context, reason ttlcache.EvictionReason, item *ttlcache.Item[string, float64]) {
 		log.Println(fmt.Sprintf("Evicting %s", item.Key()))
+		cache.Get(item.Key())
 	})
 
 	// Start the async cache worker. This manages item expiry in the cache.
